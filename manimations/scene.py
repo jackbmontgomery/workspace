@@ -1,4 +1,5 @@
-from manim import *
+import manim
+from manim import ThreeDScene
 from scipy.integrate import solve_ivp
 import numpy as np
 
@@ -23,30 +24,32 @@ class LorenzAttractor(ThreeDScene):
     def construct(self):
         #  Create axis
 
-        self.set_camera_orientation(phi=75 * DEGREES, theta=30 * DEGREES, zoom=0.7)
+        self.set_camera_orientation(
+            phi=75 * manim.DEGREES, theta=30 * manim.DEGREES, zoom=0.7
+        )
 
-        axes = ThreeDAxes(
+        axes = manim.ThreeDAxes(
             x_range=(-50, 50, 5),
             y_range=(-50, 50, 5),
             z_range=(-0, 50, 5),
         ).shift([0.0, 0.0, -2])
-        # self.add(axes)
+        self.add(axes)
 
         # Single Trajectory
 
         num_trajectories = 10
         time = 30
 
-        colors = color_gradient([BLUE_A, BLUE_E], num_trajectories)
+        colors = manim.color_gradient([manim.BLUE_A, manim.BLUE_E], num_trajectories)
         line_graphs = []
-        epsilon = 0.01
+        epsilon = 0.001
 
         for i, color in enumerate(colors):
             initial_conditions = [10, 10, 10 + i * epsilon]
 
             trajectory = ode_solution_points(lorenz_system, initial_conditions, time)
 
-            line_graph = ShowPassingFlash(
+            line_graph = manim.ShowPassingFlash(
                 axes.plot_line_graph(
                     trajectory[:, 0],
                     trajectory[:, 1],
@@ -63,6 +66,6 @@ class LorenzAttractor(ThreeDScene):
         self.play(
             *line_graphs,
             run_time=time,
-            rate_func=rate_functions.linear,
+            rate_func=manim.rate_functions.linear,
         )
         self.stop_ambient_camera_rotation(about="theta")
