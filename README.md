@@ -1,3 +1,3 @@
-# Jack Montgomery Workspace
+# Workspace
 
-Collection of personal projects that I have worked on / am working on
+Collection of single file implementations of various things
