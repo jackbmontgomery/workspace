@@ -5,11 +5,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy
 
-# Multiply steps computed from asymptotic behaviour of errors by this.
 SAFETY = 0.9
 
-MIN_FACTOR = 0.2  # Minimum allowed decrease in a step size.
-MAX_FACTOR = 10  # Maximum allowed increase in a step size.
+MIN_FACTOR = 0.2
+MAX_FACTOR = 10
 
 
 def rms_norm(x):
@@ -66,9 +65,10 @@ class RungeKutta:
         self.coords_dim = y0.size
         self.f = self.dydt(self.t, self.y)
         self.K = np.empty((self.n_stages + 1, self.coords_dim), dtype=self.y.dtype)
+
         if self.h is None:
             self.h = self._select_initial_step()
-            print("Initial Step Size", self.h)
+
         self.status = "running"
 
     def _estimate_error(self, K, h):
@@ -90,7 +90,7 @@ class RungeKutta:
             h0 = 1e-6
         else:
             h0 = 0.01 * d0 / d1
-        # Check t0+h0*direction doesn't take us beyond t_bound
+
         h0 = min(h0, interval_length)
         y1 = self.y + h0 * self.f
         f1 = self.dydt(t0 + h0, y1)
@@ -190,14 +190,13 @@ if __name__ == "__main__":
     ode = VanderPoloscillator()
     t0 = 0.0
     tf = 100.0
-    solver = RK45(ode, t0, tf)
+    solver = RK23(ode, t0, tf)
 
     y0 = np.array([1.0, 0.0])
     ts, ys = solve_ivp(solver, y0)
     ys = np.array(ys)
 
-    scipy_sol = scipy.integrate.solve_ivp(ode, (t0, tf), y0, method="RK45")
-    print(len(scipy_sol.t), len(ts))
+    scipy_sol = scipy.integrate.solve_ivp(ode, (t0, tf), y0, method="RK23")
 
     plt.plot(ys[:, 0], ys[:, 1], label="RK")
     plt.plot(scipy_sol.y[0], scipy_sol.y[1], label="Scipy")
