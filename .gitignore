@@ -14,3 +14,6 @@ wheels/
 # Added by cargo
 
 /target
+
+# Wandb
+wandb/

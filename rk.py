@@ -197,6 +197,7 @@ if __name__ == "__main__":
     ys = np.array(ys)
 
     scipy_sol = scipy.integrate.solve_ivp(ode, (t0, tf), y0, method="RK23")
+    print(len(scipy_sol.t), len(ts))
 
     plt.plot(ys[:, 0], ys[:, 1], label="RK")
     plt.plot(scipy_sol.y[0], scipy_sol.y[1], label="Scipy")
