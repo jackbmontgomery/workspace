@@ -16,6 +16,7 @@ dependencies = [
     "optax>=0.2.4",
     "requests>=2.32.3",
     "scipy>=1.15.1",
+    "stable-baselines3>=2.6.0",
     "tabula-py>=2.10.0",
     "torch>=2.6.0",
     "tyro>=0.9.26",

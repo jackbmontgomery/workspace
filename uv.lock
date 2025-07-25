@@ -2019,6 +2019,23 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/66/b7/4a1bc231e0681ebf339337b0cd05b91dc6a0d701fa852bb812e244b7a030/srt-3.5.3.tar.gz", hash = "sha256:4884315043a4f0740fd1f878ed6caa376ac06d70e135f306a6dc44632eed0cc0", size = 28296, upload-time = "2023-03-28T02:35:44.007Z" }
 
 [[package]]
+name = "stable-baselines3"
+version = "2.6.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cloudpickle" },
+    { name = "gymnasium" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/df/25/e71fabe1fdce82118a12bd8a92900d9b5c33d2a7e545ebcf5a582a5d23e9/stable_baselines3-2.6.0.tar.gz", hash = "sha256:972ef537a9a8f2b9de06cdca87ef1f33df5fc8239cfe64fed88976d7c799c2f7", size = 214085, upload-time = "2025-03-24T14:33:14.562Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/60/6900e8186168e6e23a2125655fb4fe53130256480cc7950dadcee030cd67/stable_baselines3-2.6.0-py3-none-any.whl", hash = "sha256:d4a4c95b5593c6135a5764767d829498677559069110aa3768fe1254f1c457e3", size = 184525, upload-time = "2025-03-24T14:33:12.437Z" },
+]
+
+[[package]]
 name = "stack-data"
 version = "0.6.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2352,6 +2369,7 @@ dependencies = [
     { name = "optax" },
     { name = "requests" },
     { name = "scipy" },
+    { name = "stable-baselines3" },
     { name = "tabula-py" },
     { name = "torch" },
     { name = "tyro" },
@@ -2376,6 +2394,7 @@ requires-dist = [
     { name = "optax", specifier = ">=0.2.4" },
     { name = "requests", specifier = ">=2.32.3" },
     { name = "scipy", specifier = ">=1.15.1" },
+    { name = "stable-baselines3", specifier = ">=2.6.0" },
     { name = "tabula-py", specifier = ">=2.10.0" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tyro", specifier = ">=0.9.26" },

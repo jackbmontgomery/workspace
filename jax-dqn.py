@@ -202,6 +202,7 @@ def scan_func_wrapper(
 
 def main(
     seed: int = 2025,
+    env_name: str = "CartPole-v1",
     lr: float = 3e-4,
     replay_buffer_size: int = 1000,
     replay_buffer_min_size: int = 10,
@@ -216,7 +217,7 @@ def main(
     key = jax.random.key(seed)
     key_env, key_model, key_buffer = jax.random.split(key, 3)
 
-    env, env_params = gymnax.make("CartPole-v1")
+    env, env_params = gymnax.make(env_name)
     obs_dim = env.observation_space(env_params).shape[0]
     n_actions = env.action_space(env_params).n
 
