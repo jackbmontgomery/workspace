@@ -1,5 +1,3 @@
-import copy
-
 import chex
 import equinox as eqx
 import flashbax as fbx
@@ -29,20 +27,6 @@ class DQN(eqx.Module):
         return self.layer_3(x)
 
 
-def dqn_loss(dqn, obs, actions, target_q):
-    q_values = jax.vmap(dqn)(obs)
-    batch_idx = jnp.arange(q_values.shape[0])
-    chosen_q = q_values[batch_idx, actions]
-    return jnp.mean((chosen_q - target_q) ** 2)
-
-
-grad_loss_fn = eqx.filter_value_and_grad(dqn_loss)
-
-
-def dqn_train_step():
-    pass
-
-
 @chex.dataclass
 class Carry:
     key_env: chex.PRNGKey
@@ -52,25 +36,26 @@ class Carry:
     obs: chex.Array
     epsilon: float
     buffer_state: chex.ArrayTree
-    optimizer_state: chex.ArrayTree
+    optimiser_state: chex.ArrayTree
     total_steps: int
     episode_return: float
     episode_returns: chex.Array
     episode_num: int
 
 
-def scan_func_wrapper(
+def create_scan_step_fn(
     env,
     env_params,
     buffer,
     training_frequency,
     target_update_frequency,
     discount_rate,
-    optimizer,
+    optimiser,
     epsilon_min,
     epsilon_decay,
+    episode_window_size,
 ):
-    def scan_func(carry: Carry, _):
+    def step_fn(carry: Carry, _):
         key_env = carry.key_env
         env_state = carry.env_state
         dqn = carry.dqn
@@ -78,7 +63,7 @@ def scan_func_wrapper(
         obs = carry.obs
         epsilon = carry.epsilon
         buffer_state = carry.buffer_state
-        optimizer_state = carry.optimizer_state
+        optimiser_state = carry.optimiser_state
         total_steps = carry.total_steps
         episode_return = carry.episode_return
         episode_returns = carry.episode_returns
@@ -88,10 +73,17 @@ def scan_func_wrapper(
 
         key_env, key_action, key_step, key_reset = jax.random.split(key_env, 4)
 
-        action = jax.lax.cond(
-            jax.random.uniform(key_action) < epsilon,
-            lambda: env.action_space(env_params).sample(key_action),
-            lambda: jnp.argmax(dqn(obs)),
+        def explore(epsilon):
+            action = env.action_space(env_params).sample(key_action)
+            epsilon = jnp.maximum(epsilon * epsilon_decay, epsilon_min)
+            return action, epsilon
+
+        def exploit(epsilon):
+            action = jnp.argmax(dqn(obs))
+            return action, epsilon
+
+        action, epsilon = jax.lax.cond(
+            jax.random.uniform(key_action) < epsilon, explore, exploit, epsilon
         )
 
         next_obs, env_state, reward, done, _ = env.step(
@@ -115,9 +107,11 @@ def scan_func_wrapper(
             },
         )
 
-        def train_step(args):
-            dqn, optimizer_state, key = args
-
+        def train_step(
+            dqn,
+            optimiser_state,
+            key,
+        ):
             key_env, key_sample = jax.random.split(key)
             batch = buffer.sample(buffer_state, key_sample)
 
@@ -133,52 +127,65 @@ def scan_func_wrapper(
                 batch_rewards + discount_rate * (1.0 - batch_terminations) * max_next_q
             )
 
-            loss, grads = grad_loss_fn(dqn, batch_obs, batch_actions, target_q)
-            updates, new_optimizer_state = optimizer.update(grads, optimizer_state, dqn)
-            new_dqn = eqx.apply_updates(dqn, updates)
+            def loss_fn(model: DQN):
+                q_values = jax.vmap(model)(batch_obs)
+                q_values = q_values[
+                    jnp.arange(q_values.shape[0]), batch_actions.squeeze()
+                ]
+                return jnp.mean((q_values - target_q) ** 2)
 
-            return new_dqn, new_optimizer_state, key_env
+            loss, grads = eqx.filter_value_and_grad(loss_fn)(dqn)
+            updates, optimiser_state = optimiser.update(grads, optimiser_state, dqn)
+            dqn = eqx.apply_updates(dqn, updates)
+            return dqn, optimiser_state, key_env
 
-        do_training = (total_steps % training_frequency == 0) & buffer.can_sample(
-            buffer_state
-        )
+        def no_train_step(
+            dqn,
+            optimiser_state,
+            key,
+        ):
+            return dqn, optimiser_state, key
 
-        dqn, optimizer_state, key = jax.lax.cond(
-            do_training,
+        dqn, optimiser_state, key = jax.lax.cond(
+            (total_steps % training_frequency == 0) & buffer.can_sample(buffer_state),
             train_step,
-            lambda args: args,
-            (dqn, optimizer_state, key_env),
-        )
-
-        def update_target(args):
-            target_dqn, dqn = args
-            target_dqn = copy.deepcopy(dqn)
-            return target_dqn, dqn
-
-        target_dqn, dqn = jax.lax.cond(
-            total_steps % target_update_frequency == 0,
-            update_target,
-            lambda args: args,
-            (target_dqn, dqn),
-        )
-
-        obs, env_state = jax.lax.cond(
-            done,
-            lambda: env.reset(key_reset, env_params),
-            lambda: (next_obs, env_state),
-        )
-
-        episode_return, episode_returns, episode_num = jax.lax.cond(
-            done,
-            lambda: (
-                0.0,
-                episode_returns.at[episode_num % 100].set(episode_return),
-                episode_num + 1,
+            no_train_step,
+            *(
+                dqn,
+                optimiser_state,
+                key_env,
             ),
-            lambda: (episode_return + reward, episode_returns, episode_num),
         )
 
-        epsilon = jnp.maximum(epsilon_min, epsilon * epsilon_decay)
+        target_dqn = jax.lax.cond(
+            total_steps % target_update_frequency == 0,
+            lambda: dqn,
+            lambda: target_dqn,
+        )
+
+        def update_done(
+            next_obs, env_state, episode_return, episode_returns, episode_num
+        ):
+            obs, env_state = env.reset(key_reset, env_params)
+            episode_returns = episode_returns.at[episode_num % episode_window_size].set(
+                episode_return
+            )
+            episode_num += 1
+            episode_return = 0.0
+            return obs, env_state, episode_return, episode_returns, episode_num
+
+        def update_not_done(
+            next_obs, env_state, episode_return, episode_returns, episode_num
+        ):
+            episode_return += reward
+            return next_obs, env_state, episode_return, episode_returns, episode_num
+
+        obs, env_state, episode_return, episode_returns, episode_num = jax.lax.cond(
+            done,
+            update_done,
+            update_not_done,
+            *(next_obs, env_state, episode_return, episode_returns, episode_num),
+        )
 
         carry = Carry(
             key_env=key_env,
@@ -188,16 +195,16 @@ def scan_func_wrapper(
             obs=obs,
             epsilon=epsilon,
             buffer_state=buffer_state,
-            optimizer_state=optimizer_state,
+            optimiser_state=optimiser_state,
             total_steps=total_steps,
             episode_return=episode_return,
             episode_returns=episode_returns,
             episode_num=episode_num,
         )
 
-        return carry, reward
+        return carry, ()
 
-    return scan_func
+    return step_fn
 
 
 def main(
@@ -205,14 +212,14 @@ def main(
     env_name: str = "CartPole-v1",
     lr: float = 3e-4,
     replay_buffer_size: int = 1000,
-    replay_buffer_min_size: int = 10,
     batch_size: int = 64,
     total_steps: int = 100_000,
     discount_rate: float = 0.99,
     training_frequency: int = 10,
     target_update_frequency: int = 100,
     epsilon_decay: float = 0.995,
-    epsilon_min: float = 0.1,
+    epsilon_min: float = 0.05,
+    episode_window_size: int = 100,
 ):
     key = jax.random.key(seed)
     key_env, key_model, key_buffer = jax.random.split(key, 3)
@@ -222,14 +229,14 @@ def main(
     n_actions = env.action_space(env_params).n
 
     dqn = DQN(obs_dim, n_actions, key_model)
-    target_dqn = copy.deepcopy(dqn)
+    target_dqn = dqn
 
-    optimizer = optax.adamw(lr)
-    optimizer_state = optimizer.init(eqx.filter(dqn, eqx.is_array))
+    optimiser = optax.adamw(lr)
+    optimiser_state = optimiser.init(eqx.filter(dqn, eqx.is_array))
 
     buffer = fbx.make_item_buffer(
         max_length=replay_buffer_size,
-        min_length=replay_buffer_min_size,
+        min_length=batch_size,
         sample_batch_size=batch_size,
     )
 
@@ -243,21 +250,22 @@ def main(
 
     buffer_state = buffer.init(dummy_experience)
 
-    scan_func = scan_func_wrapper(
+    env_step_fn = create_scan_step_fn(
         env,
         env_params,
         buffer,
         training_frequency,
         target_update_frequency,
         discount_rate,
-        optimizer,
+        optimiser,
         epsilon_min,
         epsilon_decay,
+        episode_window_size,
     )
 
     obs, env_state = env.reset(key_env, env_params)
 
-    episode_returns = jnp.zeros(100)
+    episode_returns = jnp.zeros(episode_window_size)
 
     init_carry = Carry(
         key_env=key_env,
@@ -267,17 +275,20 @@ def main(
         obs=obs,
         epsilon=1.0,
         buffer_state=buffer_state,
-        optimizer_state=optimizer_state,
+        optimiser_state=optimiser_state,
         total_steps=0,
         episode_return=0.0,
         episode_returns=episode_returns,
         episode_num=0,
     )
 
-    final_carry, outputs = jax.lax.scan(scan_func, init_carry, None, total_steps)
+    final_carry, _ = jax.lax.scan(env_step_fn, init_carry, None, total_steps)
 
-    print(final_carry.episode_num)
-    print(final_carry.episode_returns)
+    print("Number of Episodes", final_carry.episode_num)
+    print(
+        "Average Returns from last 100 completed episodes",
+        jnp.mean(final_carry.episode_returns),
+    )
 
 
 if __name__ == "__main__":
