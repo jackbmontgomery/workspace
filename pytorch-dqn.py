@@ -29,7 +29,6 @@ def main(
     env_name: str = "CartPole-v1",
     lr: float = 3e-4,
     replay_buffer_size: int = 1000,
-    replay_buffer_min_size: int = 10,
     batch_size: int = 64,
     total_steps: int = 100_000,
     discount_rate: float = 0.99,

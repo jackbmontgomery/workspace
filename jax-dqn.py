@@ -100,7 +100,6 @@ def create_scan_step_fn(
             buffer_state,
             {
                 "obs": obs,
-                "next_obs": next_obs,
                 "action": action,
                 "reward": reward,
                 "terminated": terminated,
@@ -115,11 +114,12 @@ def create_scan_step_fn(
             key_env, key_sample = jax.random.split(key)
             batch = buffer.sample(buffer_state, key_sample)
 
-            batch_obs = batch.experience["obs"]
-            batch_next_obs = batch.experience["next_obs"]
-            batch_actions = batch.experience["action"]
-            batch_rewards = batch.experience["reward"]
-            batch_terminations = batch.experience["terminated"]
+            batch_obs = batch.experience.first["obs"]
+            batch_actions = batch.experience.first["action"]
+            batch_rewards = batch.experience.first["reward"]
+            batch_terminations = batch.experience.first["terminated"]
+
+            batch_next_obs = batch.experience.second["obs"]
 
             next_q_values = jax.vmap(target_dqn)(batch_next_obs)
             max_next_q = jnp.max(next_q_values, axis=1)
@@ -210,7 +210,7 @@ def create_scan_step_fn(
 def main(
     seed: int = 2025,
     env_name: str = "CartPole-v1",
-    lr: float = 3e-4,
+    lr: float = 1e-3,
     replay_buffer_size: int = 1000,
     batch_size: int = 64,
     total_steps: int = 100_000,
@@ -218,7 +218,7 @@ def main(
     training_frequency: int = 10,
     target_update_frequency: int = 100,
     epsilon_decay: float = 0.995,
-    epsilon_min: float = 0.05,
+    epsilon_min: float = 0.1,
     episode_window_size: int = 100,
 ):
     key = jax.random.key(seed)
@@ -234,7 +234,7 @@ def main(
     optimiser = optax.adamw(lr)
     optimiser_state = optimiser.init(eqx.filter(dqn, eqx.is_array))
 
-    buffer = fbx.make_item_buffer(
+    buffer = fbx.make_flat_buffer(
         max_length=replay_buffer_size,
         min_length=batch_size,
         sample_batch_size=batch_size,
@@ -242,7 +242,6 @@ def main(
 
     dummy_experience = {
         "obs": jnp.zeros(obs_dim),
-        "next_obs": jnp.zeros(obs_dim),
         "action": jnp.array(0),
         "reward": jnp.array(0.0),
         "terminated": jnp.array(False),
