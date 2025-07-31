@@ -127,7 +127,7 @@ def create_scan_step_fn(
                 batch_rewards + discount_rate * (1.0 - batch_terminations) * max_next_q
             )
 
-            def loss_fn(model: DQN):
+            def loss_fn(model: dqn):
                 q_values = jax.vmap(model)(batch_obs)
                 q_values = q_values[
                     jnp.arange(q_values.shape[0]), batch_actions.squeeze()
@@ -210,7 +210,7 @@ def create_scan_step_fn(
 def main(
     seed: int = 2025,
     env_name: str = "CartPole-v1",
-    lr: float = 1e-3,
+    lr: float = 1e-4,
     replay_buffer_size: int = 1000,
     batch_size: int = 64,
     total_steps: int = 100_000,
