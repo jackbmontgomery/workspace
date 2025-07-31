@@ -1,3 +1,4 @@
+import chex
 import equinox as eqx
 import flashbax as fbx
 import gymnax
@@ -26,6 +27,21 @@ class DQN(eqx.Module):
         return self.layer_3(x)
 
 
+@chex.dataclass
+class Carry:
+    dqn: chex.ArrayTree
+    target_dqn: chex.ArrayTree
+    epsilon: float
+    step: int
+    obs: chex.Array
+    optimiser_state: chex.ArrayTree
+    env_state: chex.ArrayTree
+    buffer_state: chex.ArrayTree
+    episode_num: int
+    episode_return: float
+    episode_returns: chex.Array
+
+
 def make_buffer(replay_buffer_size, batch_size, env, env_params, key):
     buffer = fbx.make_item_buffer(
         max_length=replay_buffer_size,
@@ -49,53 +65,51 @@ def make_buffer(replay_buffer_size, batch_size, env, env_params, key):
     return buffer, buffer_state
 
 
-def main(
-    seed: int = 2025,
-    env_name: str = "CartPole-v1",
-    lr: float = 5e-3,
-    replay_buffer_size: int = 1000,
-    batch_size: int = 64,
-    total_steps: int = 5_000,
-    discount_rate: float = 0.99,
-    training_frequency: int = 10,
-    target_update_frequency: int = 100,
-    epsilon_decay: float = 0.995,
-    epsilon_min: float = 0.1,
-    episode_window_size: int = 10,
+def make_scan_training_func(
+    env,
+    env_params,
+    buffer,
+    optimiser,
+    episode_window_size,
+    training_frequency,
+    target_update_frequency,
+    discount_rate,
+    epsilon_decay,
+    epsilon_min,
 ):
-    key = jax.random.key(seed)
+    def training_func(carry: Carry, key_step):
+        dqn = carry.dqn
+        target_dqn = carry.target_dqn
+        obs = carry.obs
+        env_state = carry.env_state
 
-    env, env_params = gymnax.make(env_name)
-    obs_dim = env.observation_space(env_params).shape[0]
-    n_actions = env.action_space(env_params).n
+        optimiser_state = carry.optimiser_state
+        env_state = carry.env_state
+        buffer_state = carry.buffer_state
 
-    dqn = DQN(obs_dim, n_actions, key)
-    target_dqn = DQN(obs_dim, n_actions, key)
+        episode_num = carry.episode_num
+        episode_return = carry.episode_return
+        episode_returns = carry.episode_returns
 
-    optimiser = optax.adamw(lr)
-    optimiser_state = optimiser.init(eqx.filter(dqn, eqx.is_array))
+        epsilon = carry.epsilon
+        step = carry.step
 
-    buffer, buffer_state = make_buffer(
-        replay_buffer_size, batch_size, env, env_params, key
-    )
-
-    obs, env_state = env.reset(key, env_params)
-
-    episode_returns = jnp.zeros(episode_window_size)
-    episode_num = 1
-    episode_return = 0
-    eps_samples = jax.random.uniform(key, total_steps)
-    epsilon = 1
-
-    for step in range(total_steps):
-        if eps_samples[step] < epsilon:
-            act_key, key = jax.random.split(key)
+        def explore(eps, key):
+            act_key, key = jax.random.split(key_step)
             action = env.action_space(env_params).sample(act_key)
-            epsilon = jnp.maximum(epsilon * epsilon_decay, epsilon_min)
-        else:
-            action = jnp.argmax(dqn(obs))
+            eps = jnp.maximum(eps * epsilon_decay, epsilon_min)
+            return action, eps
 
-        key_step, key = jax.random.split(key)
+        def exploit(eps, key):
+            action = jnp.argmax(dqn(obs))
+            return action, eps
+
+        action, eps = jax.lax.cond(
+            jax.random.uniform(key_step) < epsilon,
+            explore,
+            exploit,
+            *(epsilon, key_step),
+        )
 
         next_obs, env_state, reward, done, _ = env.step(
             key_step, env_state, action, env_params
@@ -115,28 +129,31 @@ def main(
 
         episode_return += reward
 
-        if done:
-            reset_key, key = jax.random.split(key)
-
+        def conclude_episode(
+            episode_returns, episode_return, episode_num, obs, env_state
+        ):
             episode_returns = episode_returns.at[episode_num % episode_window_size].set(
                 episode_return
             )
 
-            obs, env_state = env.reset(reset_key, env_params)
-            episode_return = 0
+            obs, env_state = env.reset(key_step, env_params)
+            episode_return = 0.0
             episode_num += 1
+            return episode_returns, episode_return, episode_num, obs, env_state
 
-            if episode_num % episode_window_size == 0:
-                print(
-                    f"Episode Number {episode_num} - Average Last 10: {jnp.average(episode_returns):.3f}"
-                )
-
-        else:
+        def move_obs(episode_returns, episode_return, episode_num, obs, env_state):
             obs = next_obs
+            return episode_returns, episode_return, episode_num, obs, env_state
 
-        if step % training_frequency and buffer.can_sample(buffer_state):
-            key_sample, key = jax.random.split(key)
-            sample = buffer.sample(buffer_state, key_sample)
+        episode_returns, episode_return, episode_num, obs, env_state = jax.lax.cond(
+            done,
+            conclude_episode,
+            move_obs,
+            *(episode_returns, episode_return, episode_num, obs, env_state),
+        )
+
+        def train_dqn(dqn, optimiser_state):
+            sample = buffer.sample(buffer_state, key_step)
 
             batch_obs = sample.experience["obs"]
             batch_next_obs = sample.experience["next_obs"]
@@ -160,8 +177,114 @@ def main(
             updates, optimiser_state = optimiser.update(grads, optimiser_state, dqn)
             dqn = optax.apply_updates(dqn, updates)
 
-        if step % target_update_frequency == 0:
-            target_dqn = optax.incremental_update(dqn, target_dqn, 1)
+            return dqn, optimiser_state
+
+        def skip_training_fn(dqn, optimiser_state):
+            return dqn, optimiser_state
+
+        dqn, optimiser_state = jax.lax.cond(
+            (jnp.mod(step, training_frequency) == 0) & buffer.can_sample(buffer_state),
+            train_dqn,
+            skip_training_fn,
+            *(dqn, optimiser_state),
+        )
+
+        target_dqn = jax.lax.cond(
+            step % target_update_frequency,
+            lambda target_dqn: optax.incremental_update(dqn, target_dqn, 1),
+            lambda target_dqn: target_dqn,
+            target_dqn,
+        )
+
+        carry = Carry(
+            dqn=dqn,
+            target_dqn=target_dqn,
+            epsilon=epsilon,
+            step=step,
+            obs=obs,
+            optimiser_state=optimiser_state,
+            env_state=env_state,
+            buffer_state=buffer_state,
+            episode_num=episode_num,
+            episode_return=episode_return,
+            episode_returns=episode_returns,
+        )
+
+        return carry, ()
+
+    return training_func
+
+
+def main(
+    seed: int = 42,
+    env_name: str = "CartPole-v1",
+    lr: float = 3e-4,
+    replay_buffer_size: int = 1000,
+    batch_size: int = 64,
+    total_steps: int = 5_000,
+    discount_rate: float = 0.99,
+    training_frequency: int = 10,
+    target_update_frequency: int = 100,
+    epsilon_decay: float = 0.995,
+    epsilon_min: float = 0.1,
+    episode_window_size: int = 100,
+):
+    key = jax.random.key(seed)
+
+    env, env_params = gymnax.make(env_name)
+    obs_dim = env.observation_space(env_params).shape[0]
+    n_actions = env.action_space(env_params).n
+
+    dqn = DQN(obs_dim, n_actions, key)
+    target_dqn = DQN(obs_dim, n_actions, key)
+
+    optimiser = optax.adamw(lr)
+    optimiser_state = optimiser.init(eqx.filter(dqn, eqx.is_array))
+
+    buffer, buffer_state = make_buffer(
+        replay_buffer_size, batch_size, env, env_params, key
+    )
+
+    obs, env_state = env.reset(key, env_params)
+
+    episode_returns = jnp.zeros(episode_window_size)
+    episode_num = 1
+    episode_return = 0
+    epsilon = 1.0
+    step = 0
+
+    scan_training_func = make_scan_training_func(
+        env,
+        env_params,
+        buffer,
+        optimiser,
+        episode_window_size,
+        training_frequency,
+        target_update_frequency,
+        discount_rate,
+        epsilon_decay,
+        epsilon_min,
+    )
+
+    init_carry = Carry(
+        dqn=dqn,
+        target_dqn=target_dqn,
+        epsilon=epsilon,
+        step=step,
+        obs=obs,
+        optimiser_state=optimiser_state,
+        env_state=env_state,
+        buffer_state=buffer_state,
+        episode_num=episode_num,
+        episode_return=episode_return,
+        episode_returns=episode_returns,
+    )
+
+    step_keys = jax.random.split(key, total_steps)
+
+    final_carry, _ = jax.lax.scan(scan_training_func, init_carry, step_keys)
+
+    print(jnp.mean(final_carry.episode_returns))
 
 
 if __name__ == "__main__":
