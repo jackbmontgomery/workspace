@@ -2,6 +2,44 @@
 
 Collection of single file implementations from various areas of interest.
 
+## `eqx-optax.py`
+
+This module provides a minimal JAX-based implementation of neural network training using **Equinox** for model definition and **Optax** for optimization. The implementation demonstrates function approximation by learning to fit $\sin(2x)$ over the interval $[0, 2\pi]$.
+
+### Architecture and Loss
+
+The `NN` class implements a simple feedforward network: input → 32 → 32 → output, with sigmoid activations in hidden layers. The training objective uses mean squared error:
+$$
+L(\theta) = \frac{1}{n} \sum_{i=1}^{n} (y_i - f(x_i; \theta))^2
+$$
+
+### Training Implementation
+
+The core training step is implemented as a JIT-compiled pure function:
+```python
+@eqx.filter_jit
+def make_step(model, opt_state, x, y, optimizer):
+    loss, grads = grad_loss_fn(model, x, y)
+    updates, opt_state = optimizer.update(grads, opt_state, model)
+    model = eqx.apply_updates(model, updates)
+    return model, opt_state, loss
+```
+
+This design ensures:
+- **JIT Compilation**: Entire training step optimized at compile time
+- **Immutability**: All state updates return new objects
+- **Filtered Gradients**: Only trainable parameters receive updates via `eqx.filter_value_and_grad`
+
+The implementation uses AdamW with learning rate $\alpha = 3 \times 10^{-4}$ and trains on uniformly sampled points to approximate the target function $y = \sin(2x)$.
+
+### Key Benefits
+
+The functional programming approach provides clean separation between model definition, loss computation, and optimization steps, while JAX's JIT compilation ensures efficient execution of the training loop.
+
+### Reference
+[1] D. P. Kingma, J. Ba, "Adam: A Method for Stochastic Optimization," *ICLR*, 2015.
+
+---
 ## `rk.py`
 
 This module provides an implementation of adaptive step size Runge-Kutta methods, specifically the **RK23** and **RK45** integrators. The implementation draws inspiration from `scipy.integrate`, while relying heavily on the foundational treatment of these methods in Hairer et al. [1].
