@@ -30,7 +30,7 @@ def main(
     lr: float = 3e-4,
     replay_buffer_size: int = 1000,
     batch_size: int = 64,
-    total_steps: int = 100_000,
+    total_steps: int = 40_000,
     discount_rate: float = 0.99,
     training_frequency: int = 10,
     target_update_frequency: int = 100,
@@ -56,7 +56,6 @@ def main(
         handle_timeout_termination=False,
     )
 
-    num_steps = 0
     epsilon = 1
     current_episode_return = 0
     episode_returns = np.zeros(100)
@@ -64,8 +63,7 @@ def main(
 
     obs, info = env.reset()
 
-    while num_steps < total_steps:
-        num_steps += 1
+    for step in range(total_steps):
         if random.random() < epsilon:
             action = env.action_space.sample()
             epsilon = max(epsilon_decay * epsilon, 0.1)
@@ -82,7 +80,7 @@ def main(
         done = terminated or truncated
         obs = next_obs
 
-        if num_steps % training_frequency == 0 and replay_buffer.size() > batch_size:
+        if step % training_frequency == 0 and replay_buffer.size() > batch_size:
             sample = replay_buffer.sample(batch_size)
 
             with torch.no_grad():
@@ -101,7 +99,7 @@ def main(
 
             optimiser.step()
 
-        if total_steps % target_update_frequency == 0:
+        if step % target_update_frequency == 0:
             target_dqn.load_state_dict(dqn.state_dict())
 
         if done:
