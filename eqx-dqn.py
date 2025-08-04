@@ -92,11 +92,10 @@ def make_scan_training_func(
         episode_returns = carry.episode_returns
 
         epsilon = carry.epsilon
-        step = carry.step
+        step = carry.step + 1
 
         def explore(eps, key):
-            act_key, key = jax.random.split(key_step)
-            action = env.action_space(env_params).sample(act_key)
+            action = env.action_space(env_params).sample(key)
             eps = jnp.maximum(eps * epsilon_decay, epsilon_min)
             return action, eps
 
@@ -104,7 +103,7 @@ def make_scan_training_func(
             action = jnp.argmax(dqn(obs))
             return action, eps
 
-        action, eps = jax.lax.cond(
+        action, epsilon = jax.lax.cond(
             jax.random.uniform(key_step) < epsilon,
             explore,
             exploit,
@@ -115,7 +114,10 @@ def make_scan_training_func(
             key_step, env_state, action, env_params
         )
 
-        terminated = done
+        terminated = jnp.logical_and(
+            done, env_state.time < env_params.max_steps_in_episode
+        )
+
         buffer_state = buffer.add(
             buffer_state,
             {
@@ -152,7 +154,7 @@ def make_scan_training_func(
             *(episode_returns, episode_return, episode_num, obs, env_state),
         )
 
-        def train_dqn(dqn, optimiser_state):
+        def train_dqn(model, optimiser_state):
             sample = buffer.sample(buffer_state, key_step)
 
             batch_obs = sample.experience["obs"]
@@ -173,22 +175,22 @@ def make_scan_training_func(
                 ]
                 return jnp.mean(jnp.power(q_values - target_q_values, 2))
 
-            grads = train_step(dqn, target_q_values)
-            updates, optimiser_state = optimiser.update(grads, optimiser_state, dqn)
-            dqn = optax.apply_updates(dqn, updates)
-
-            return dqn, optimiser_state
+            grads = train_step(model, target_q_values)
+            updates, optimiser_state = optimiser.update(grads, optimiser_state, model)
+            model = optax.apply_updates(model, updates)
+            return model, optimiser_state
 
         def skip_training_fn(dqn, optimiser_state):
             return dqn, optimiser_state
 
         dqn, optimiser_state = jax.lax.cond(
-            (jnp.mod(step, training_frequency) == 0) & buffer.can_sample(buffer_state),
+            jnp.logical_and(
+                step % training_frequency == 0, buffer.can_sample(buffer_state)
+            ),
             train_dqn,
             skip_training_fn,
             *(dqn, optimiser_state),
         )
-
         target_dqn = jax.lax.cond(
             step % target_update_frequency,
             lambda target_dqn: optax.incremental_update(dqn, target_dqn, 1),
@@ -216,12 +218,12 @@ def make_scan_training_func(
 
 
 def main(
-    seed: int = 42,
+    seed: int = 100,
     env_name: str = "CartPole-v1",
-    lr: float = 3e-4,
+    lr: float = 5e-3,
     replay_buffer_size: int = 1000,
     batch_size: int = 64,
-    total_steps: int = 5_000,
+    total_steps: int = 100_000,
     discount_rate: float = 0.99,
     training_frequency: int = 10,
     target_update_frequency: int = 100,
