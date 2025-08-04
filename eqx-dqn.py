@@ -4,10 +4,53 @@ import flashbax as fbx
 import gymnax
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import optax
 import tyro
 
 jax.config.update("jax_enable_x64", True)
+
+
+def plot_episode_returns(rewards: jnp.ndarray, dones: jnp.ndarray, window_size=50):
+    episode_returns = []
+    running_total = 0.0
+
+    for r, d in zip(rewards, dones):
+        running_total += r
+        if d:
+            episode_returns.append(running_total)
+            running_total = 0.0
+
+    episode_returns = jnp.array(episode_returns)
+
+    if len(episode_returns) >= window_size:
+        running_avg = jnp.convolve(
+            episode_returns, jnp.ones(window_size) / window_size, mode="valid"
+        )
+        padding = jnp.full(window_size - 1, jnp.nan)
+        running_avg = jnp.concatenate([padding, running_avg])
+    else:
+        running_avg = jnp.full_like(episode_returns, jnp.nan)
+
+    plt.plot(
+        jnp.arange(len(episode_returns)),
+        episode_returns,
+        marker="o",
+        label="Episode Returns",
+    )
+    plt.plot(
+        jnp.arange(len(running_avg)),
+        running_avg,
+        color="red",
+        label=f"{window_size}-Episode Running Average",
+    )
+    plt.xlabel("Episode")
+    plt.ylabel("Return")
+    plt.title("Episode Returns with Running Average")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 
 class DQN(eqx.Module):
@@ -38,8 +81,15 @@ class Carry:
     env_state: chex.ArrayTree
     buffer_state: chex.ArrayTree
     episode_num: int
-    episode_return: float
-    episode_returns: chex.Array
+
+
+@chex.dataclass
+class StepData:
+    reward: float
+    done: bool
+    terminated: bool
+    truncated: bool
+    epsilon: float
 
 
 def make_buffer(replay_buffer_size, batch_size, env, env_params, key):
@@ -70,7 +120,6 @@ def make_scan_training_func(
     env_params,
     buffer,
     optimiser,
-    episode_window_size,
     training_frequency,
     target_update_frequency,
     discount_rate,
@@ -88,8 +137,6 @@ def make_scan_training_func(
         buffer_state = carry.buffer_state
 
         episode_num = carry.episode_num
-        episode_return = carry.episode_return
-        episode_returns = carry.episode_returns
 
         epsilon = carry.epsilon
         step = carry.step + 1
@@ -118,6 +165,10 @@ def make_scan_training_func(
             done, env_state.time < env_params.max_steps_in_episode
         )
 
+        truncated = jnp.logical_and(
+            done, env_state.time >= env_params.max_steps_in_episode
+        )
+
         buffer_state = buffer.add(
             buffer_state,
             {
@@ -129,29 +180,20 @@ def make_scan_training_func(
             },
         )
 
-        episode_return += reward
-
-        def conclude_episode(
-            episode_returns, episode_return, episode_num, obs, env_state
-        ):
-            episode_returns = episode_returns.at[episode_num % episode_window_size].set(
-                episode_return
-            )
-
+        def conclude_episode(episode_num, obs, env_state):
             obs, env_state = env.reset(key_step, env_params)
-            episode_return = 0.0
             episode_num += 1
-            return episode_returns, episode_return, episode_num, obs, env_state
+            return episode_num, obs, env_state
 
-        def move_obs(episode_returns, episode_return, episode_num, obs, env_state):
+        def move_obs(episode_num, obs, env_state):
             obs = next_obs
-            return episode_returns, episode_return, episode_num, obs, env_state
+            return episode_num, obs, env_state
 
-        episode_returns, episode_return, episode_num, obs, env_state = jax.lax.cond(
+        episode_num, obs, env_state = jax.lax.cond(
             done,
             conclude_episode,
             move_obs,
-            *(episode_returns, episode_return, episode_num, obs, env_state),
+            *(episode_num, obs, env_state),
         )
 
         def train_dqn(model, optimiser_state):
@@ -208,11 +250,17 @@ def make_scan_training_func(
             env_state=env_state,
             buffer_state=buffer_state,
             episode_num=episode_num,
-            episode_return=episode_return,
-            episode_returns=episode_returns,
         )
 
-        return carry, ()
+        step_data = StepData(
+            reward=reward,
+            done=done,
+            terminated=terminated,
+            truncated=truncated,
+            epsilon=epsilon,
+        )
+
+        return carry, step_data
 
     return training_func
 
@@ -223,13 +271,12 @@ def main(
     lr: float = 5e-3,
     replay_buffer_size: int = 1000,
     batch_size: int = 64,
-    total_steps: int = 100_000,
+    total_steps: int = 40_000,
     discount_rate: float = 0.99,
     training_frequency: int = 10,
     target_update_frequency: int = 100,
     epsilon_decay: float = 0.995,
     epsilon_min: float = 0.1,
-    episode_window_size: int = 100,
 ):
     key = jax.random.key(seed)
 
@@ -249,9 +296,7 @@ def main(
 
     obs, env_state = env.reset(key, env_params)
 
-    episode_returns = jnp.zeros(episode_window_size)
     episode_num = 1
-    episode_return = 0
     epsilon = 1.0
     step = 0
 
@@ -260,7 +305,6 @@ def main(
         env_params,
         buffer,
         optimiser,
-        episode_window_size,
         training_frequency,
         target_update_frequency,
         discount_rate,
@@ -278,15 +322,12 @@ def main(
         env_state=env_state,
         buffer_state=buffer_state,
         episode_num=episode_num,
-        episode_return=episode_return,
-        episode_returns=episode_returns,
     )
 
     step_keys = jax.random.split(key, total_steps)
+    final_carry, step_history = jax.lax.scan(scan_training_func, init_carry, step_keys)
 
-    final_carry, _ = jax.lax.scan(scan_training_func, init_carry, step_keys)
-
-    print(jnp.mean(final_carry.episode_returns))
+    plot_episode_returns(step_history.reward, step_history.done)
 
 
 if __name__ == "__main__":
