@@ -266,7 +266,7 @@ def make_scan_training_func(
 
 
 def main(
-    seed: int = 100,
+    seed: int = 42,
     env_name: str = "CartPole-v1",
     lr: float = 5e-3,
     replay_buffer_size: int = 1000,
