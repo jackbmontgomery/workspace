@@ -2373,6 +2373,7 @@ dependencies = [
     { name = "stable-baselines3" },
     { name = "tabula-py" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "tyro" },
     { name = "wandb" },
 ]
@@ -2399,6 +2400,7 @@ requires-dist = [
     { name = "stable-baselines3", specifier = ">=2.6.0" },
     { name = "tabula-py", specifier = ">=2.10.0" },
     { name = "torch", specifier = ">=2.6.0" },
+    { name = "tqdm", specifier = ">=4.67.1" },
     { name = "tyro", specifier = ">=0.9.26" },
     { name = "wandb", specifier = ">=0.21.0" },
 ]

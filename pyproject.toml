@@ -20,6 +20,7 @@ dependencies = [
     "stable-baselines3>=2.6.0",
     "tabula-py>=2.10.0",
     "torch>=2.6.0",
+    "tqdm>=4.67.1",
     "tyro>=0.9.26",
     "wandb>=0.21.0",
 ]
