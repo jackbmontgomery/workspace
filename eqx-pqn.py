@@ -109,7 +109,6 @@ def generate_rollout(
         q_values = q_network(obs)
 
         max_action = jnp.argmax(q_values, axis=-1)
-
         random_action = jax.random.randint(
             prng_key,
             shape=max_action.shape,
@@ -157,14 +156,14 @@ def generate_rollout(
 
 def main(
     seed: int = 2025,
-    num_envs: int = 2,
+    num_envs: int = 64,
     env_id: str = "CartPole-v1",
-    lr: float = 1e-3,
-    num_steps: int = 15,
+    lr: float = 5e-3,
+    num_steps: int = 128,
     init_eps: float = 1.0,
     min_eps: float = 0.05,
     exploration_fraction: float = 0.5,
-    total_timesteps: int = 50,
+    total_timesteps: int = 5_000_000,
     num_minibatches: int = 4,
     update_epochs: int = 4,
     gamma: float = 0.99,
@@ -173,6 +172,7 @@ def main(
 ):
     batch_size = int(num_envs * num_steps)
     minibatch_size = int(batch_size // num_minibatches)
+    num_iterations = total_timesteps // batch_size
 
     key = jax.random.key(seed)
 
@@ -196,70 +196,83 @@ def main(
 
     global_step = 0
 
-    key_reset = jax.random.split(key, num_envs)
-    obs, env_state = jax.vmap(env.reset, in_axes=(0, None))(key_reset, env_params)
+    for iteration in range(1, num_iterations + 1):
+        print("Iteration No:", iteration)
+        iteration_key, key = jax.random.split(key)
 
-    rollout_key = jax.random.split(key, num_envs)
+        key_reset = jax.random.split(key, num_envs)
 
-    final_carry, rollout = vmapped_generate_rollout(
-        obs,
-        env_state,
-        rollout_key,
-        q_network,
-        env,
-        env_params,
-        num_steps,
-        total_timesteps * exploration_fraction,
-        global_step,
-        init_eps,
-        min_eps,
-    )
+        obs, env_state = jax.vmap(env.reset, in_axes=(0, None))(key_reset, env_params)
 
-    returns = jnp.zeros_like(rollout.reward)
+        rollout_keys = jax.random.split(key, num_envs)
 
-    for t in reversed(range(num_steps)):
-        if t == num_steps - 1:
-            next_value = jnp.max(eqx.filter_vmap(q_network)(final_carry.obs), axis=-1)
-            nextnonterminal = 1.0 - final_carry.done
-            returns = returns.at[:, t].set(
-                rollout.reward[:, t] + gamma * next_value * nextnonterminal
-            )
-        else:
-            nextnonterminal = 1.0 - rollout.done[:, t + 1]
-            next_value = rollout.value[:, t + 1]
-            returns = returns.at[:, t].set(
-                rollout.reward[:, t]
-                + gamma
-                * (q_lambda * returns[:, t + 1] + (1 - q_lambda) * next_value)
-                * nextnonterminal
-            )
+        final_carry, rollout = vmapped_generate_rollout(
+            obs,
+            env_state,
+            rollout_keys,
+            q_network,
+            env,
+            env_params,
+            num_steps,
+            total_timesteps * exploration_fraction,
+            global_step,
+            init_eps,
+            min_eps,
+        )
 
-    b_obs = rollout.obs.reshape((-1,) + env.observation_space(env_params).shape)
-    b_actions = rollout.action.reshape((-1,) + env.action_space(env_params).shape)
-    b_returns = returns.reshape(-1)
+        global_step += num_envs * num_steps
 
-    b_inds = jnp.arange(batch_size)
+        returns = jnp.zeros_like(rollout.reward)
 
-    for epoch in range(update_epochs):
-        permute_key, key = jax.random.split(key)
+        for t in reversed(range(num_steps)):
+            if t == num_steps - 1:
+                next_value = jnp.max(
+                    eqx.filter_vmap(q_network)(final_carry.obs), axis=-1
+                )
+                nextnonterminal = 1.0 - final_carry.done
+                returns = returns.at[:, t].set(
+                    rollout.reward[:, t] + gamma * next_value * nextnonterminal
+                )
+            else:
+                nextnonterminal = 1.0 - rollout.done[:, t + 1]
+                next_value = rollout.value[:, t + 1]
+                returns = returns.at[:, t].set(
+                    rollout.reward[:, t]
+                    + gamma
+                    * (q_lambda * returns[:, t + 1] + (1 - q_lambda) * next_value)
+                    * nextnonterminal
+                )
 
-        b_inds = jax.random.permutation(key, batch_size)
+        b_obs = rollout.obs.reshape((-1,) + env.observation_space(env_params).shape)
+        b_actions = rollout.action.reshape((-1,) + env.action_space(env_params).shape)
+        b_returns = returns.reshape(-1)
 
-        for start in range(0, batch_size, minibatch_size):
-            end = start + minibatch_size
-            mb_inds = b_inds[start:end]
+        b_inds = jnp.arange(batch_size)
 
-            @eqx.filter_grad
-            def train_step(q_network, target_q_values):
-                q_values = eqx.filter_vmap(q_network)(b_obs[mb_inds])
-                q_values = q_values[jnp.arange(q_values.shape[0]), b_actions[mb_inds]]
-                return jnp.mean(jnp.power(q_values - target_q_values, 2))
+        for epoch in range(update_epochs):
+            permute_key, key = jax.random.split(key)
 
-            grads = train_step(q_network, b_returns[mb_inds])
+            b_inds = jax.random.permutation(key, batch_size)
 
-            updates, optim_state = tx.update(grads, optim_state, q_network)
-            q_network = eqx.apply_updates(q_network, updates)
-            # q_network = optax.apply_updates(q_network, updates)
+            for start in range(0, batch_size, minibatch_size):
+                end = start + minibatch_size
+                mb_inds = b_inds[start:end]
+
+                @eqx.filter_value_and_grad
+                def train_step(q_network, target_q_values):
+                    q_values = eqx.filter_vmap(q_network)(b_obs[mb_inds])
+                    q_values = q_values[
+                        jnp.arange(q_values.shape[0]), b_actions[mb_inds]
+                    ]
+                    return jnp.mean(jnp.power(q_values - target_q_values, 2))
+
+                loss, grads = train_step(q_network, b_returns[mb_inds])
+
+                updates, optim_state = tx.update(grads, optim_state, q_network)
+                q_network = eqx.apply_updates(q_network, updates)
+
+        avg_return = returns[:, 0].mean()
+        print(f"Average return: {avg_return:.2f}")
 
 
 if __name__ == "__main__":
