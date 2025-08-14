@@ -3,6 +3,7 @@ import equinox as eqx
 import gymnax
 import jax
 import jax.numpy as jnp
+import optax
 import tyro
 
 
@@ -10,6 +11,7 @@ import tyro
 class Carry:
     obs: chex.Array
     env_state: chex.ArrayTree
+    done: chex.ArrayTree
 
 
 @chex.dataclass
@@ -32,7 +34,8 @@ def layer_init(key, shape, std=jnp.sqrt(2), bias_const=0.0):
     w_init = jax.nn.initializers.orthogonal(std)
     b_init = jax.nn.initializers.constant(bias_const)
     weight = w_init(w_key, shape)
-    bias = b_init(b_key, (shape[0],))  # bias shape = out_features
+    bias = b_init(b_key, (shape[0],))
+
     return weight, bias
 
 
@@ -135,11 +138,11 @@ def generate_rollout(
             done, reset, lambda o, s: (o, s), *(obs, env_state)
         )
 
-        carry = Carry(obs=obs, env_state=env_state)
+        carry = Carry(obs=obs, env_state=env_state, done=done)
 
         return carry, step_data
 
-    init_carry = Carry(obs=obs, env_state=env_state)
+    init_carry = Carry(obs=obs, env_state=env_state, done=False)
 
     prng_keys = jax.random.split(key, num_steps)
 
@@ -149,20 +152,27 @@ def generate_rollout(
 
     xs = StepInput(prng_key=prng_keys, epsilon=epsilon_values)
 
-    final_carry, rollout = jax.lax.scan(rollout_scan_func, init_carry, xs)
-
-    return rollout
+    return jax.lax.scan(rollout_scan_func, init_carry, xs)
 
 
-def main():
-    seed = 2025
-    num_envs = 2
-    env_id = "CartPole-v1"
-    num_steps = 15
-    init_eps = 1
-    min_eps = 0.05
-    exploration_fraction = 0.5
-    total_timesteps = 50
+def main(
+    seed: int = 2025,
+    num_envs: int = 2,
+    env_id: str = "CartPole-v1",
+    lr: float = 1e-3,
+    num_steps: int = 15,
+    init_eps: float = 1.0,
+    min_eps: float = 0.05,
+    exploration_fraction: float = 0.5,
+    total_timesteps: int = 50,
+    num_minibatches: int = 4,
+    update_epochs: int = 4,
+    gamma: float = 0.99,
+    q_lambda: float = 0.65,
+    max_grad_norm: float = 10.0,
+):
+    batch_size = int(num_envs * num_steps)
+    minibatch_size = int(batch_size // num_minibatches)
 
     key = jax.random.key(seed)
 
@@ -172,18 +182,26 @@ def main():
         env.observation_space(env_params), env.action_space(env_params), key
     )
 
-    # Multiple Envs
-    key_reset = jax.random.split(key, num_envs)
-    obs, env_state = jax.vmap(env.reset, in_axes=(0, None))(key_reset, env_params)
+    tx = optax.chain(
+        optax.clip_by_global_norm(max_grad_norm),
+        optax.radam(learning_rate=lr),
+    )
 
-    rollout_key = jax.random.split(key, num_envs)
+    optim_state = tx.init(eqx.filter(q_network, eqx.is_array))
 
     vmapped_generate_rollout = jax.vmap(
         generate_rollout,
         in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
     )
 
-    rollout = vmapped_generate_rollout(
+    global_step = 0
+
+    key_reset = jax.random.split(key, num_envs)
+    obs, env_state = jax.vmap(env.reset, in_axes=(0, None))(key_reset, env_params)
+
+    rollout_key = jax.random.split(key, num_envs)
+
+    final_carry, rollout = vmapped_generate_rollout(
         obs,
         env_state,
         rollout_key,
@@ -192,12 +210,56 @@ def main():
         env_params,
         num_steps,
         total_timesteps * exploration_fraction,
-        0,
+        global_step,
         init_eps,
         min_eps,
     )
 
-    print(rollout.done)
+    returns = jnp.zeros_like(rollout.reward)
+
+    for t in reversed(range(num_steps)):
+        if t == num_steps - 1:
+            next_value = jnp.max(eqx.filter_vmap(q_network)(final_carry.obs), axis=-1)
+            nextnonterminal = 1.0 - final_carry.done
+            returns = returns.at[:, t].set(
+                rollout.reward[:, t] + gamma * next_value * nextnonterminal
+            )
+        else:
+            nextnonterminal = 1.0 - rollout.done[:, t + 1]
+            next_value = rollout.value[:, t + 1]
+            returns = returns.at[:, t].set(
+                rollout.reward[:, t]
+                + gamma
+                * (q_lambda * returns[:, t + 1] + (1 - q_lambda) * next_value)
+                * nextnonterminal
+            )
+
+    b_obs = rollout.obs.reshape((-1,) + env.observation_space(env_params).shape)
+    b_actions = rollout.action.reshape((-1,) + env.action_space(env_params).shape)
+    b_returns = returns.reshape(-1)
+
+    b_inds = jnp.arange(batch_size)
+
+    for epoch in range(update_epochs):
+        permute_key, key = jax.random.split(key)
+
+        b_inds = jax.random.permutation(key, batch_size)
+
+        for start in range(0, batch_size, minibatch_size):
+            end = start + minibatch_size
+            mb_inds = b_inds[start:end]
+
+            @eqx.filter_grad
+            def train_step(q_network, target_q_values):
+                q_values = eqx.filter_vmap(q_network)(b_obs[mb_inds])
+                q_values = q_values[jnp.arange(q_values.shape[0]), b_actions[mb_inds]]
+                return jnp.mean(jnp.power(q_values - target_q_values, 2))
+
+            grads = train_step(q_network, b_returns[mb_inds])
+
+            updates, optim_state = tx.update(grads, optim_state, q_network)
+            q_network = eqx.apply_updates(q_network, updates)
+            # q_network = optax.apply_updates(q_network, updates)
 
 
 if __name__ == "__main__":
