@@ -31,25 +31,29 @@ class StepData:
 
 def layer_init(key, shape, std=jnp.sqrt(2), bias_const=0.0):
     w_key, b_key = jax.random.split(key)
+
     w_init = jax.nn.initializers.orthogonal(std)
     b_init = jax.nn.initializers.constant(bias_const)
+
     weight = w_init(w_key, shape)
     bias = b_init(b_key, (shape[0],))
 
     return weight, bias
 
 
-class Linear(eqx.Module):
-    weight: jnp.ndarray
-    bias: jnp.ndarray
+class Linear(eqx.nn.Linear):
+    weight: chex.Array
+    bias: chex.Array
+    in_features: int
+    out_features: int
+    use_bias: bool
 
     def __init__(self, in_features, out_features, key, std=jnp.sqrt(2), bias_const=0.0):
+        super().__init__(in_features, out_features, use_bias=True, key=key)
+
         self.weight, self.bias = layer_init(
             key, (out_features, in_features), std, bias_const
         )
-
-    def __call__(self, x):
-        return jnp.dot(x, self.weight.T) + self.bias
 
 
 class QNetwork(eqx.Module):
@@ -100,15 +104,18 @@ def generate_rollout(
     min_eps,
 ):
     def rollout_scan_func(carry: Carry, step_input: StepInput):
-        obs = carry.obs
+        prev_obs = carry.obs
+        prev_done = carry.done
+
         env_state = carry.env_state
 
         prng_key = step_input.prng_key
         epsilon = step_input.epsilon
 
-        q_values = q_network(obs)
+        q_values = q_network(prev_obs)
 
         max_action = jnp.argmax(q_values, axis=-1)
+
         random_action = jax.random.randint(
             prng_key,
             shape=max_action.shape,
@@ -127,7 +134,7 @@ def generate_rollout(
         )
 
         step_data = StepData(
-            obs=obs, action=action, reward=reward, done=done, value=value
+            obs=prev_obs, action=action, reward=reward, done=prev_done, value=value
         )
 
         def reset(obs, env_state, key_reset=prng_key, env_params=env_params):
@@ -156,14 +163,14 @@ def generate_rollout(
 
 def main(
     seed: int = 2025,
-    num_envs: int = 64,
+    num_envs: int = 2,
     env_id: str = "CartPole-v1",
     lr: float = 5e-3,
-    num_steps: int = 128,
+    num_steps: int = 16,
     init_eps: float = 1.0,
     min_eps: float = 0.05,
     exploration_fraction: float = 0.5,
-    total_timesteps: int = 5_000_000,
+    total_timesteps: int = 32,
     num_minibatches: int = 4,
     update_epochs: int = 4,
     gamma: float = 0.99,
@@ -194,22 +201,23 @@ def main(
         in_axes=(0, 0, 0, None, None, None, None, None, None, None, None),
     )
 
+    vmapped_reset = jax.vmap(env.reset, in_axes=(0, None))
+
     global_step = 0
 
     for iteration in range(1, num_iterations + 1):
         print("Iteration No:", iteration)
-        iteration_key, key = jax.random.split(key)
+        key_reset, key_rollout, key = jax.random.split(key, 3)
 
-        key_reset = jax.random.split(key, num_envs)
+        env_key_reset = jax.random.split(key_reset, num_envs)
 
-        obs, env_state = jax.vmap(env.reset, in_axes=(0, None))(key_reset, env_params)
-
-        rollout_keys = jax.random.split(key, num_envs)
+        obs, env_state = vmapped_reset(env_key_reset, env_params)
+        env_key_rollout = jax.random.split(key_rollout, num_envs)
 
         final_carry, rollout = vmapped_generate_rollout(
             obs,
             env_state,
-            rollout_keys,
+            env_key_rollout,
             q_network,
             env,
             env_params,
@@ -243,6 +251,8 @@ def main(
                     * nextnonterminal
                 )
 
+        print("done", rollout.done)
+        print("returns", returns)
         b_obs = rollout.obs.reshape((-1,) + env.observation_space(env_params).shape)
         b_actions = rollout.action.reshape((-1,) + env.action_space(env_params).shape)
         b_returns = returns.reshape(-1)
@@ -270,9 +280,6 @@ def main(
 
                 updates, optim_state = tx.update(grads, optim_state, q_network)
                 q_network = eqx.apply_updates(q_network, updates)
-
-        avg_return = returns[:, 0].mean()
-        print(f"Average return: {avg_return:.2f}")
 
 
 if __name__ == "__main__":
