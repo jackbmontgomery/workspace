@@ -1,9 +1,16 @@
+from functools import partial
+from typing import Tuple
+
 import chex
 import equinox as eqx
-import gymnax
 import jax
 import jax.numpy as jnp
+import jaxmarl
 import optax
+
+# from jaxmarl.environments.mpe import MPEVisualizer
+from jaxmarl.environments.multi_agent_env import MultiAgentEnv, State
+from jaxmarl.wrappers.baselines import JaxMARLWrapper
 
 jax.config.update("jax_enable_x64", True)
 
@@ -28,6 +35,7 @@ class StepData:
     action: chex.Array
     reward: chex.Array
     done: chex.Array
+    env_state: chex.ArrayTree
     value: chex.Array
 
 
@@ -62,16 +70,23 @@ class Linear(eqx.nn.Linear):
 
 class QNetwork(eqx.Module):
     layer_1: eqx.nn.Linear
-    norm_1: eqx.nn.LayerNorm
     layer_2: eqx.nn.Linear
-    norm_2: eqx.nn.LayerNorm
     layer_3: eqx.nn.Linear
+    norm_1: eqx.nn.LayerNorm
+    norm_2: eqx.nn.LayerNorm
+    num_agents: int = eqx.static_field()
+    single_num_actions: int = eqx.static_field()
+    single_obs_size: int = eqx.static_field()
 
-    def __init__(self, single_observation_space, single_action_space, key):
-        obs_size = jnp.array(single_observation_space.shape).prod()
-        num_actions = single_action_space.n
-
+    def __init__(self, single_obs_size, single_num_actions, num_agents, key):
         keys = jax.random.split(key, 3)
+
+        self.num_agents = num_agents
+        self.single_num_actions = single_num_actions
+        self.single_obs_size = single_obs_size
+
+        obs_size = single_obs_size * num_agents
+        num_actions = single_num_actions * num_agents
 
         self.layer_1 = Linear(obs_size, 120, key=keys[0])
         self.norm_1 = eqx.nn.LayerNorm(120)
@@ -82,9 +97,41 @@ class QNetwork(eqx.Module):
         self.layer_3 = Linear(84, num_actions, key=keys[2])
 
     def __call__(self, x):
+        x = jnp.ravel(x)
         x = jax.nn.relu(self.norm_1(self.layer_1(x)))
         x = jax.nn.relu(self.norm_2(self.layer_2(x)))
-        return self.layer_3(x)
+        x = jnp.reshape(self.layer_3(x), (self.num_agents, self.single_num_actions))
+        # x = self.layer_3(x)
+        return x
+
+
+class ArrayWrapper(JaxMARLWrapper):
+    def __init__(self, env: MultiAgentEnv):
+        super().__init__(env)
+
+        self.single_num_actions = env.action_space(env.agents[0]).n
+        self.single_obs_size = env.observation_space(env.agents[0]).shape[0]
+
+    @partial(jax.jit, static_argnums=(0,))
+    def reset(self, key: chex.PRNGKey) -> Tuple[chex.Array, State]:
+        obs, env_state = self._env.reset(key)
+        obs = self._batchify_floats(obs)
+        return obs, env_state
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step(
+        self, key: chex.PRNGKey, env_state: State, action: chex.Array
+    ) -> Tuple[chex.Array, State, chex.Array, bool, dict]:
+        action = {
+            agent: agent_action for agent, agent_action in zip(self._env.agents, action)
+        }
+        obs, env_state, reward, done, info = self._env.step(key, env_state, action)
+
+        obs = self._batchify_floats(obs)
+        reward = self._batchify_floats(reward)
+        done = self._batchify_floats(done)
+
+        return obs, env_state, reward, done, info
 
 
 def linear_schedule_array(
@@ -97,8 +144,7 @@ def linear_schedule_array(
 
 
 class EnvironmentStepper:
-    def __init__(self, env_params, env):
-        self.env_params = env_params
+    def __init__(self, env):
         self.env = env
 
     def __call__(self, carry: Carry, step_input: StepInput):
@@ -110,7 +156,6 @@ class EnvironmentStepper:
 
         prng_key = step_input.prng_key
         epsilon = step_input.epsilon
-
         q_values = q_network(prev_obs)
 
         max_action = jnp.argmax(q_values, axis=-1)
@@ -119,21 +164,24 @@ class EnvironmentStepper:
             prng_key,
             shape=max_action.shape,
             minval=0,
-            maxval=self.env.action_space(self.env_params).n,
+            maxval=self.env.single_num_actions,
         )
 
         explore = jax.random.uniform(prng_key) < epsilon
 
         action = jnp.where(explore, random_action, max_action)
 
-        value = q_values[action]
+        value = jnp.take_along_axis(q_values, action[:, None], axis=1).squeeze(-1)
 
-        obs, env_state, reward, done, _ = self.env.step(
-            prng_key, env_state, action, self.env_params
-        )
+        obs, env_state, reward, done, _ = self.env.step(prng_key, env_state, action)
 
         step_data = StepData(
-            obs=prev_obs, action=action, reward=reward, done=prev_done, value=value
+            obs=prev_obs,
+            action=action,
+            reward=reward,
+            done=prev_done,
+            value=value,
+            env_state=env_state,
         )
 
         carry = Carry(obs=obs, env_state=env_state, done=done, q_network=q_network)
@@ -151,7 +199,10 @@ def generate_rollout_wrapper(num_steps, duration, init_eps, min_eps):
         obs, env_state = stepper.env.reset(key)
 
         init_carry = Carry(
-            obs=obs, env_state=env_state, done=False, q_network=q_network
+            obs=obs,
+            env_state=env_state,
+            done=jnp.full((stepper.env.num_agents,), False),
+            q_network=q_network,
         )
 
         prng_keys = jax.random.split(key, num_steps)
@@ -183,6 +234,7 @@ def compute_returns_wrapper(num_steps, gamma, q_lambda):
             else:
                 nextnonterminal = 1.0 - rollout.done[:, t + 1]
                 next_value = rollout.value[:, t + 1]
+
                 returns = returns.at[:, t].set(
                     rollout.reward[:, t]
                     + gamma
@@ -195,7 +247,9 @@ def compute_returns_wrapper(num_steps, gamma, q_lambda):
     return compute_returns
 
 
-def train_batch_wrapper(env, env_params, update_epochs, batch_size, minibatch_size, tx):
+def train_batch_wrapper(
+    env: MultiAgentEnv, update_epochs, batch_size, minibatch_size, tx
+):
     def train_batch(
         q_network: QNetwork,
         optim_state: chex.ArrayTree,
@@ -203,9 +257,10 @@ def train_batch_wrapper(env, env_params, update_epochs, batch_size, minibatch_si
         returns: jax.Array,
         key: chex.PRNGKey,
     ):
-        b_obs = rollout.obs.reshape((-1,) + env.observation_space(env_params).shape)
-        b_actions = rollout.action.reshape((-1,) + env.action_space(env_params).shape)
-        b_returns = returns.reshape(-1)
+        b_obs = rollout.obs.reshape((-1,) + (env.num_agents, env.single_obs_size))
+        b_actions = rollout.action.reshape((-1,) + (env.num_agents,))
+
+        b_returns = returns.reshape((-1,) + (env.num_agents,))
 
         b_inds = jnp.arange(batch_size)
 
@@ -222,15 +277,18 @@ def train_batch_wrapper(env, env_params, update_epochs, batch_size, minibatch_si
                 @eqx.filter_value_and_grad
                 def train_step(q_network, target_q_values):
                     q_values = eqx.filter_vmap(q_network)(b_obs[mb_inds])
-                    q_values = q_values[
-                        jnp.arange(q_values.shape[0]), b_actions[mb_inds]
-                    ]
+
+                    q_values = jnp.take_along_axis(
+                        q_values, b_actions[mb_inds][..., None], axis=-1
+                    ).squeeze(axis=-1)
+
                     return jnp.mean(jnp.power(q_values - target_q_values, 2))
 
                 loss, grads = train_step(q_network, b_returns[mb_inds])
 
                 updates, optim_state = tx.update(grads, optim_state, q_network)
                 q_network = eqx.apply_updates(q_network, updates)
+
         return q_network, optim_state
 
     return train_batch
@@ -239,9 +297,9 @@ def train_batch_wrapper(env, env_params, update_epochs, batch_size, minibatch_si
 def main(
     seed: int = 2025,
     num_envs: int = 8,
-    env_id: str = "CartPole-v1",
-    lr: float = 5e-3,
-    num_steps: int = 128,
+    env_id: str = "MPE_simple_v3",
+    lr: float = 1e-3,
+    num_steps: int = 100,
     init_eps: float = 1.0,
     min_eps: float = 0.1,
     total_timesteps: int = 50_000,
@@ -257,12 +315,15 @@ def main(
     num_iterations = total_timesteps // batch_size
 
     key = jax.random.key(seed)
+    env = ArrayWrapper(jaxmarl.make(env_id))
 
-    env, env_params = gymnax.make(env_id)
+    # Assumption of homogonous agents for now
+    agent = env.agents[0]
+    num_agents = env.num_agents
+    obs_size = env.observation_space(agent).shape[0]
+    num_actions = env.action_space(agent).n
 
-    q_network = QNetwork(
-        env.observation_space(env_params), env.action_space(env_params), key
-    )
+    q_network = QNetwork(obs_size, num_actions, num_agents, key)
 
     tx = optax.chain(
         optax.clip_by_global_norm(max_grad_norm),
@@ -271,7 +332,7 @@ def main(
 
     optim_state = tx.init(eqx.filter(q_network, eqx.is_array))
 
-    stepper = EnvironmentStepper(env_params=env_params, env=env)
+    stepper = EnvironmentStepper(env=env)
 
     generate_rollout = generate_rollout_wrapper(
         num_steps,
@@ -279,12 +340,13 @@ def main(
         init_eps,
         min_eps,
     )
+
     vmap_generate_rollout = jax.vmap(generate_rollout, in_axes=(0, None, None, None))
 
     compute_returns = compute_returns_wrapper(num_steps, gamma, q_lambda)
 
     train_batch = train_batch_wrapper(
-        env, env_params, update_epochs, batch_size, minibatch_size, tx
+        env, update_epochs, batch_size, minibatch_size, tx
     )
 
     global_step = 0
@@ -305,12 +367,20 @@ def main(
             q_network, optim_state, rollout, returns, iteration_key
         )
 
-        total_dones = int(jnp.sum(rollout.done))
+        avg_rewards = jnp.mean(rollout.reward, axis=(0, 1))
+
         print(
             f"[Iteration {i}/{num_iterations}] "
             f"Global Step: {global_step:,} | "
-            f"Dones in rollout: {total_dones}/{num_envs * num_steps}"
+            f"Avg reward per agent: {avg_rewards} "
         )
+
+        final_carry, rollout = generate_rollout(
+            iteration_key, stepper, q_network, total_timesteps * exploration_fraction
+        )
+
+        # viz = MPEVisualizer(env, rollout.env_state)
+        # viz.animate(save_fname=f"{i}.gif", view=False)
 
 
 if __name__ == "__main__":
