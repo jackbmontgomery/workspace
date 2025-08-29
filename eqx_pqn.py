@@ -225,6 +225,7 @@ def train_batch_wrapper(env, env_params, update_epochs, batch_size, minibatch_si
                     q_values = q_values[
                         jnp.arange(q_values.shape[0]), b_actions[mb_inds]
                     ]
+
                     return jnp.mean(jnp.power(q_values - target_q_values, 2))
 
                 loss, grads = train_step(q_network, b_returns[mb_inds])

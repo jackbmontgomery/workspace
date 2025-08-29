@@ -7,8 +7,6 @@ import jax
 import jax.numpy as jnp
 import jaxmarl
 import optax
-
-# from jaxmarl.environments.mpe import MPEVisualizer
 from jaxmarl.environments.multi_agent_env import MultiAgentEnv, State
 from jaxmarl.wrappers.baselines import JaxMARLWrapper
 
@@ -101,7 +99,6 @@ class QNetwork(eqx.Module):
         x = jax.nn.relu(self.norm_1(self.layer_1(x)))
         x = jax.nn.relu(self.norm_2(self.layer_2(x)))
         x = jnp.reshape(self.layer_3(x), (self.num_agents, self.single_num_actions))
-        # x = self.layer_3(x)
         return x
 
 
@@ -297,8 +294,8 @@ def train_batch_wrapper(
 def main(
     seed: int = 2025,
     num_envs: int = 8,
-    env_id: str = "MPE_simple_v3",
-    lr: float = 1e-3,
+    env_id: str = "MPE_simple_spread_v3",
+    lr: float = 5e-3,
     num_steps: int = 100,
     init_eps: float = 1.0,
     min_eps: float = 0.1,
@@ -315,6 +312,7 @@ def main(
     num_iterations = total_timesteps // batch_size
 
     key = jax.random.key(seed)
+
     env = ArrayWrapper(jaxmarl.make(env_id))
 
     # Assumption of homogonous agents for now
@@ -322,6 +320,8 @@ def main(
     num_agents = env.num_agents
     obs_size = env.observation_space(agent).shape[0]
     num_actions = env.action_space(agent).n
+
+    print(obs_size, num_actions, num_agents)
 
     q_network = QNetwork(obs_size, num_actions, num_agents, key)
 
@@ -367,20 +367,17 @@ def main(
             q_network, optim_state, rollout, returns, iteration_key
         )
 
-        avg_rewards = jnp.mean(rollout.reward, axis=(0, 1))
+        average_rewards = jnp.mean(rollout.reward, axis=(0, 1))
 
         print(
             f"[Iteration {i}/{num_iterations}] "
             f"Global Step: {global_step:,} | "
-            f"Avg reward per agent: {avg_rewards} "
+            f"Average Rewards: {average_rewards}"
         )
 
-        final_carry, rollout = generate_rollout(
-            iteration_key, stepper, q_network, total_timesteps * exploration_fraction
-        )
-
-        # viz = MPEVisualizer(env, rollout.env_state)
-        # viz.animate(save_fname=f"{i}.gif", view=False)
+    print("Training Done - Saving Model")
+    with open("./models/marl.eqx", "wb") as f:
+        eqx.tree_serialise_leaves(f, q_network)
 
 
 if __name__ == "__main__":
