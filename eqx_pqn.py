@@ -144,8 +144,8 @@ def generate_rollout_wrapper(num_steps, duration, init_eps, min_eps):
     def rollout_wrapper(
         key: chex.PRNGKey,
         stepper: EnvironmentStepper,
-        q_network: QNetwork,
         global_step: int,
+        q_network: QNetwork,
     ):
         obs, env_state = stepper.env.reset(key)
 
@@ -242,10 +242,10 @@ def main(
     num_envs: int = 8,
     env_id: str = "CartPole-v1",
     lr: float = 5e-3,
-    num_steps: int = 128,
+    num_steps: int = 500,
     init_eps: float = 1.0,
     min_eps: float = 0.1,
-    total_timesteps: int = 50_000,
+    total_timesteps: int = 100_000,
     exploration_fraction: float = 0.5,
     num_minibatches: int = 4,
     update_epochs: int = 4,
@@ -295,7 +295,7 @@ def main(
         rollout_keys = jax.random.split(key, num_envs)
 
         final_carry, rollout = vmap_generate_rollout(
-            rollout_keys, stepper, q_network, global_step
+            rollout_keys, stepper, global_step, q_network
         )
 
         global_step += num_envs * num_steps
